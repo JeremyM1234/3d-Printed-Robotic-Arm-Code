@@ -1,0 +1,475 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+// OLED Display settings (128x64 I2C at 400kHz Fast Mode)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, 400000UL, 400000UL);
+bool oledReady = false;
+unsigned long lastOledUpdate = 0;
+const unsigned long OLED_UPDATE_MS = 200; // 5 FPS during servo motion
+
+// Outro animation timing (runs at ~28 FPS once servos are parked at HOME)
+bool outroActive = false;
+unsigned long outroStartTime = 0;
+const unsigned long OUTRO_FRAME_MS = 35;   // 35ms per frame (~28 FPS)
+const unsigned long OUTRO_TOTAL_MS = 5000; // 5 seconds total animation + hold
+
+// Button wired between Digital Pin 2 and GND
+const int BUTTON_PIN = 2;
+
+// Claw tuning angles (0.0 to 50.0 range)
+const float CLAW_OPEN_ANGLE = 30.0f;     // Jaws open while waiting at HOME
+const float CLAW_GRIP_ANGLE = 5.0f;      // Clamped angle
+const unsigned long GRAB_PAUSE_MS = 800; // Pause 0.8s after clamping before moving arm
+
+// Double-click and smooth upright return settings
+const unsigned long DOUBLE_CLICK_MS = 1000; // Max time (1s) between clicks for a double-click
+const unsigned long RETURN_MS = 2000;       // 2.0s smooth glide back to upright HOME
+
+// Base (10), Shoulder (5), Elbow (6), Wrist (9), Claw (3)
+const int SERVO_COUNT = 5;
+const int pins[SERVO_COUNT] = {10, 5, 6, 9, 3};
+const float HOME[SERVO_COUNT] = {0, 90, 90, 0, CLAW_OPEN_ANGLE};
+
+Servo servos[SERVO_COUNT];
+
+// Track current servo angles and snapshot angles for smooth return
+float currentAngles[SERVO_COUNT] = {0, 90, 90, 0, CLAW_OPEN_ANGLE};
+float returnStartAngles[SERVO_COUNT] = {0, 90, 90, 0, CLAW_OPEN_ANGLE};
+
+// 28 seconds total for arm motion, plus initial grab pause
+const unsigned long ROUTINE_MS = 28000;
+const unsigned long UPDATE_MS = 20;
+const float RAMP_SECONDS = 2.0f;
+const float TWO_PI_F = 6.28318530718f;
+
+unsigned long sequenceStart = 0;
+unsigned long returnStartTime = 0;
+unsigned long lastUpdate = 0;
+
+bool finished = true;
+bool returningHome = false;
+
+// Non-blocking debounce and double-click tracking
+int stableButtonState = HIGH;
+int lastRawReading = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_MS = 50;
+
+unsigned long lastClickTime = 0;
+bool clickPending = false;
+
+float smoothRamp(float x) {
+  x = constrain(x, 0.0f, 1.0f);
+  return x * x * x *
+    (10.0f + x * (-15.0f + 6.0f * x));
+}
+
+float wave(float seconds, float period, float phase = 0.0f) {
+  return 0.5f - 0.5f *
+    cosf(TWO_PI_F * seconds / period + phase);
+}
+
+void calculateAngles(float seconds, float angles[]) {
+  float duration = ROUTINE_MS / 1000.0f;
+
+  float rampIn = smoothRamp(seconds / RAMP_SECONDS);
+  float rampOut = smoothRamp(
+    (duration - seconds) / RAMP_SECONDS
+  );
+  float envelope = rampIn * rampOut;
+
+  float basePhase = TWO_PI_F * (
+    seconds / 5.5f +
+    0.12f * sinf(TWO_PI_F * seconds / 13.0f)
+  );
+
+  float reachPhase = TWO_PI_F * (
+    seconds / 4.2f +
+    0.13f * sinf(TWO_PI_F * seconds / 11.0f + 0.4f)
+  );
+
+  float curlPhase = TWO_PI_F * (
+    seconds / 6.3f +
+    0.18f * sinf(TWO_PI_F * seconds / 15.0f)
+  ) + 1.57f;
+
+  float reach = 0.5f - 0.5f * cosf(reachPhase);
+  float curl = 0.5f - 0.5f * cosf(curlPhase);
+
+  float centre = 85.0f +
+    10.0f * sinf(TWO_PI_F * seconds / 19.0f);
+
+  float amplitude = 55.0f +
+    20.0f * wave(seconds, 17.0f, 1.0f);
+
+  float movingBase = centre - amplitude * cosf(basePhase);
+  float movingShoulder = 55.0f + 80.0f * reach;
+  float movingElbow = 70.0f + 75.0f *
+    (reach + (1.0f - reach) * curl);
+
+  angles[0] = envelope * movingBase;
+
+  angles[1] = 90.0f +
+    envelope * (movingShoulder - 90.0f);
+
+  angles[2] = 90.0f +
+    envelope * (movingElbow - 90.0f);
+
+  // Level wrist calibration
+  angles[3] = angles[2] - angles[1];
+
+  // Keep the claw locked at the grip angle throughout the whole routine
+  angles[4] = CLAW_GRIP_ANGLE;
+}
+
+void writeAngle(int joint, float angle) {
+  float maximum = (joint == 4) ? 50.0f : 180.0f;
+  angle = constrain(angle, 0.0f, maximum);
+  currentAngles[joint] = angle;
+
+  int pulse = (int)(
+    MIN_PULSE_WIDTH +
+    angle * (MAX_PULSE_WIDTH - MIN_PULSE_WIDTH) / 180.0f +
+    0.5f
+  );
+
+  servos[joint].writeMicroseconds(pulse);
+}
+
+void drawTelemetryElements(const char* statusTitle, float progress, float elapsedSec, float totalSec) {
+  // 1. Centered "ROBOTIC ARM" Title Banner (Top 14 pixels)
+  display.fillRoundRect(0, 0, 128, 14, 2, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(31, 3);
+  display.print(F("ROBOTIC ARM"));
+
+  // 2. State & Timer Line
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 17);
+  display.print(statusTitle);
+  if (!finished || returningHome) {
+    display.print(F(" "));
+    display.print(elapsedSec, 1);
+    display.print(F("/"));
+    display.print(totalSec, 1);
+    display.print(F("s"));
+  }
+
+  // 3. Live Joint Angles Readout
+  display.setCursor(0, 27);
+  display.print(F("B:"));
+  display.print((int)roundf(currentAngles[0]));
+  display.print(F("  S:"));
+  display.print((int)roundf(currentAngles[1]));
+  display.print(F("  E:"));
+  display.print((int)roundf(currentAngles[2]));
+
+  display.setCursor(0, 37);
+  display.print(F("W:"));
+  display.print((int)roundf(currentAngles[3]));
+  display.print(F(" (LVL)  Claw:"));
+  display.print((int)roundf(currentAngles[4]));
+
+  // 4. Large Bottom Progress Bar (17 pixels tall)
+  display.drawRect(0, 47, 128, 17, SSD1306_WHITE);
+  int fillWidth = (int)(constrain(progress, 0.0f, 1.0f) * 124.0f + 0.5f);
+  if (fillWidth > 0) {
+    display.fillRect(2, 49, fillWidth, 13, SSD1306_WHITE);
+  }
+}
+
+void updateOLED(const char* statusTitle, float progress, float elapsedSec, float totalSec) {
+  if (!oledReady) return;
+  display.clearDisplay();
+  drawTelemetryElements(statusTitle, progress, elapsedSec, totalSec);
+  display.display();
+}
+
+void updateOutroOLED(unsigned long elapsed) {
+  if (!oledReady) return;
+  display.clearDisplay();
+
+  // Stage 1 (0 to 500ms): Cinema shutter curtains wipe the telemetry screen to the center
+  if (elapsed < 500) {
+    drawTelemetryElements("DONE", 1.0f, 28.0f, 28.0f);
+
+    float t = smoothRamp(elapsed / 500.0f);
+    int curtainH = (int)(t * 32.0f + 0.5f);
+
+    if (curtainH > 0) {
+      display.fillRect(0, 0, 128, curtainH, SSD1306_BLACK);
+      display.fillRect(0, 64 - curtainH, 128, curtainH, SSD1306_BLACK);
+      display.drawFastHLine(0, curtainH, 128, SSD1306_WHITE);
+      display.drawFastHLine(0, 63 - curtainH, 128, SSD1306_WHITE);
+    }
+    display.display();
+    return;
+  }
+
+  // Stage 2 (500 to 1100ms): Rounded frame unfolds smoothly from the center line
+  if (elapsed < 1100) {
+    float t = smoothRamp((elapsed - 500) / 600.0f);
+    int halfW = (int)(t * 62.0f + 0.5f);
+    int halfH = (int)(t * 28.0f + 0.5f);
+
+    if (halfW > 2 && halfH > 2) {
+      display.drawRoundRect(64 - halfW, 32 - halfH, halfW * 2, halfH * 2, 4, SSD1306_WHITE);
+    }
+
+    if (t > 0.55f) {
+      display.fillRoundRect(28, 7, 72, 13, 3, SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(40, 10);
+      display.print(F("FINISHED"));
+    }
+    display.display();
+    return;
+  }
+
+  // Stage 3 (1100 to 5000ms): Typewriter reveal of "Thank you for watching!" + expanding underline
+  display.drawRoundRect(2, 4, 124, 56, 4, SSD1306_WHITE);
+  display.fillRoundRect(28, 7, 72, 13, 3, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(40, 10);
+  display.print(F("FINISHED"));
+
+  const char* line1 = "Thank you for"; // 13 chars
+  const char* line2 = "watching!";     // 9 chars
+  float textProgress = constrain((elapsed - 1100) / 1300.0f, 0.0f, 1.0f);
+  int charsToShow = (int)(textProgress * 22.0f + 0.5f);
+
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(25, 26);
+  for (int i = 0; i < 13 && i < charsToShow; i++) {
+    display.print(line1[i]);
+  }
+
+  display.setCursor(37, 38);
+  for (int i = 0; i < 9 && (i + 13) < charsToShow; i++) {
+    display.print(line2[i]);
+  }
+
+  int lineHalf = (int)(smoothRamp(textProgress) * 42.0f + 0.5f);
+  if (lineHalf > 0) {
+    display.drawFastHLine(64 - lineHalf, 51, lineHalf * 2, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
+void writeHome() {
+  for (int j = 0; j < SERVO_COUNT; j++) {
+    writeAngle(j, HOME[j]);
+  }
+}
+
+void startRoutine() {
+  writeAngle(4, CLAW_GRIP_ANGLE);
+
+  sequenceStart = millis();
+  lastUpdate = sequenceStart;
+  lastOledUpdate = sequenceStart;
+  outroActive = false;
+  returningHome = false;
+  finished = false;
+
+  Serial.println(F("Clamping object and starting 28-second routine."));
+  updateOLED("CLAMPING", 0.0f, 0.0f, GRAB_PAUSE_MS / 1000.0f);
+}
+
+void startSmoothReturn() {
+  for (int j = 0; j < SERVO_COUNT; j++) {
+    returnStartAngles[j] = currentAngles[j];
+  }
+
+  returnStartTime = millis();
+  lastUpdate = returnStartTime;
+  lastOledUpdate = returnStartTime;
+  outroActive = false;
+  returningHome = true;
+  finished = false;
+
+  Serial.println(F("Double-click detected! Smoothly returning to upright HOME."));
+  updateOLED("HOMING", 0.0f, 0.0f, RETURN_MS / 1000.0f);
+}
+
+void checkButton() {
+  int reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  if (reading != lastRawReading) {
+    lastDebounceTime = now;
+  }
+  lastRawReading = reading;
+
+  if ((now - lastDebounceTime) >= DEBOUNCE_MS) {
+    if (reading != stableButtonState) {
+      stableButtonState = reading;
+
+      // Trigger on button press (active LOW)
+      if (stableButtonState == LOW) {
+        if (clickPending && (now - lastClickTime <= DOUBLE_CLICK_MS)) {
+          clickPending = false;
+          startSmoothReturn();
+        } else {
+          clickPending = true;
+          lastClickTime = now;
+
+          if (finished && !returningHome) {
+            startRoutine();
+          }
+        }
+      }
+    }
+  }
+
+  if (clickPending && (now - lastClickTime > DOUBLE_CLICK_MS)) {
+    clickPending = false;
+  }
+}
+
+void checkSerial() {
+  for (int n = 0; n < 16 && Serial.available() > 0; n++) {
+    char c = (char)Serial.read();
+
+    if ((c == 'r' || c == 'R') && finished) {
+      startRoutine();
+    } else if (c == 'h' || c == 'H') {
+      startSmoothReturn();
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  for (int j = 0; j < SERVO_COUNT; j++) {
+    servos[j].attach(pins[j]);
+    writeAngle(j, HOME[j]);
+  }
+
+  // Initialize OLED over 400kHz Fast I2C
+  if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Wire.setClock(400000UL);
+    oledReady = true;
+    updateOLED("STATUS: READY", 0.0f, 0.0f, 28.0f);
+  } else {
+    Serial.println(F("OLED not detected on 0x3C - running servos without screen."));
+  }
+
+  Serial.println(F("Arm at HOME. Single-click to run, double-click (within 1s) to return upright."));
+}
+
+void loop() {
+  checkSerial();
+  checkButton();
+
+  unsigned long now = millis();
+
+  // Play the smooth 28 FPS ending animation when the routine finishes
+  if (finished) {
+    if (outroActive && (now - lastOledUpdate >= OUTRO_FRAME_MS)) {
+      lastOledUpdate = now;
+      unsigned long outroElapsed = now - outroStartTime;
+
+      if (outroElapsed >= OUTRO_TOTAL_MS) {
+        outroActive = false;
+        updateOLED("STATUS: READY", 0.0f, 0.0f, 28.0f);
+      } else {
+        updateOutroOLED(outroElapsed);
+      }
+    }
+    return;
+  }
+
+  if (now - lastUpdate < UPDATE_MS) return;
+  lastUpdate = now;
+
+  // 1. Handle smooth 2-second glide back to upright HOME after a double-click
+  if (returningHome) {
+    unsigned long returnElapsed = now - returnStartTime;
+
+    if (returnElapsed >= RETURN_MS) {
+      writeHome();
+      returningHome = false;
+      finished = true;
+      updateOLED("STATUS: READY", 0.0f, 0.0f, 28.0f);
+      Serial.println(F("Upright HOME reached and claw opened. Press button to run again."));
+      return;
+    }
+
+    float progress = (float)returnElapsed / (float)RETURN_MS;
+    float t = smoothRamp(progress);
+    float angles[SERVO_COUNT];
+
+    angles[0] = returnStartAngles[0] + t * (HOME[0] - returnStartAngles[0]);
+    angles[1] = returnStartAngles[1] + t * (HOME[1] - returnStartAngles[1]);
+    angles[2] = returnStartAngles[2] + t * (HOME[2] - returnStartAngles[2]);
+    angles[3] = angles[2] - angles[1];
+    angles[4] = returnStartAngles[4];
+
+    for (int j = 0; j < SERVO_COUNT; j++) {
+      writeAngle(j, angles[j]);
+    }
+
+    if (now - lastOledUpdate >= OLED_UPDATE_MS) {
+      lastOledUpdate = now;
+      updateOLED("HOMING", progress, returnElapsed / 1000.0f, RETURN_MS / 1000.0f);
+    }
+    return;
+  }
+
+  // 2. Handle initial 0.8s grab pause
+  unsigned long totalElapsed = now - sequenceStart;
+
+  if (totalElapsed < GRAB_PAUSE_MS) {
+    writeAngle(4, CLAW_GRIP_ANGLE);
+    if (now - lastOledUpdate >= OLED_UPDATE_MS) {
+      lastOledUpdate = now;
+      float grabProgress = (float)totalElapsed / (float)GRAB_PAUSE_MS;
+      updateOLED("CLAMPING", grabProgress, totalElapsed / 1000.0f, GRAB_PAUSE_MS / 1000.0f);
+    }
+    return;
+  }
+
+  // 3. Handle main 28-second routine
+  unsigned long moveElapsed = totalElapsed - GRAB_PAUSE_MS;
+
+  if (moveElapsed >= ROUTINE_MS) {
+    writeHome();
+    finished = true;
+    outroActive = true;
+    outroStartTime = now;
+    lastOledUpdate = now;
+    updateOutroOLED(0);
+    Serial.println(F("Finished and released object. Playing OLED outro animation."));
+    return;
+  }
+
+  float moveSec = moveElapsed / 1000.0f;
+  float angles[SERVO_COUNT];
+  calculateAngles(moveSec, angles);
+
+  for (int j = 0; j < SERVO_COUNT; j++) {
+    writeAngle(j, angles[j]);
+  }
+
+  if (now - lastOledUpdate >= OLED_UPDATE_MS) {
+    lastOledUpdate = now;
+    float routineProgress = (float)moveElapsed / (float)ROUTINE_MS;
+    updateOLED("RUNNING", routineProgress, moveSec, ROUTINE_MS / 1000.0f);
+  }
+}
